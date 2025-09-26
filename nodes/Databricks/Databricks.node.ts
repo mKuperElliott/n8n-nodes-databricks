@@ -26,6 +26,59 @@ interface DatabricksCredentials {
   token: string;
 }
 
+// --- Databricks SQL helpers ---
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function postSqlStatement(
+  ctx: IExecuteFunctions,
+  host: string,
+  token: string,
+  body: any,
+) {
+  return ctx.helpers.httpRequest({
+    method: 'POST',
+    url: `${host}/api/2.0/sql/statements`,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body,
+    json: true,
+  });
+}
+
+async function getSqlStatement(
+  ctx: IExecuteFunctions,
+  host: string,
+  token: string,
+  statementId: string,
+) {
+  return ctx.helpers.httpRequest({
+    method: 'GET',
+    url: `${host}/api/2.0/sql/statements/${encodeURIComponent(statementId)}`,
+    headers: { Authorization: `Bearer ${token}` },
+    json: true,
+  });
+}
+
+// IMPORTANT: External chunk links are presigned storage URLs -> do NOT send Authorization headers.
+async function fetchExternalChunkJson(url: string) {
+  // n8n provides a global fetch in recent versions; if not, replace with a plain https request helper.
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Chunk fetch failed: ${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+function rowsToItems(
+  columns: Array<{ name: string }>,
+  dataArray: any[][],
+): INodeExecutionData[] {
+  const headers = columns.map((c) => c.name);
+  return (dataArray || []).map((row) => ({
+    json: Object.fromEntries(row.map((v, i) => [headers[i], v])),
+  }));
+}
+
 export class Databricks implements INodeType {
   description: INodeTypeDescription = {
       displayName: 'Databricks',
@@ -83,63 +136,6 @@ export class Databricks implements INodeType {
           ...vectorSearchParameters,
       ],
   };
-
-  // --- Databricks SQL helpers ---
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function postSqlStatement(
-  ctx: IExecuteFunctions,
-  host: string,
-  token: string,
-  body: any,
-) {
-  return ctx.helpers.httpRequest({
-    method: 'POST',
-    url: `${host}/api/2.0/sql/statements`,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body,
-    json: true,
-  });
-}
-
-async function getSqlStatement(
-  ctx: IExecuteFunctions,
-  host: string,
-  token: string,
-  statementId: string,
-) {
-  return ctx.helpers.httpRequest({
-    method: 'GET',
-    url: `${host}/api/2.0/sql/statements/${encodeURIComponent(statementId)}`,
-    headers: { Authorization: `Bearer ${token}` },
-    json: true,
-  });
-}
-
-// IMPORTANT: External chunk links are presigned storage URLs -> do
-NOT send Authorization headers.
-async function fetchExternalChunkJson(url: string) {
-  // n8n provides a global fetch in recent versions; if not, replace
-with a plain https request helper.
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Chunk fetch failed: ${res.status}
-${res.statusText}`);
-  return res.json();
-}
-
-function rowsToItems(
-  columns: Array<{ name: string }>,
-  dataArray: any[][],
-): INodeExecutionData[] {
-  const headers = columns.map((c) => c.name);
-  return (dataArray || []).map((row) => ({
-    json: Object.fromEntries(row.map((v, i) => [headers[i], v])),
-  }));
-
 
   async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
       const items = this.getInputData();
@@ -303,6 +299,98 @@ function rowsToItems(
                   });
 
                   returnData.push({ json: response });
+              } else if (resource === 'databricksSql') {
+                  const credentials = (await this.getCredentials('databricks')) as DatabricksCredentials;
+                  const host = credentials.host;
+                
+                  if (operation === 'executeQuery') {
+                    // --- Read node params (your UI uses "query" for SQL text, plus warehouseId & additionalFields.*) ---
+                    const warehouseId = this.getNodeParameter('warehouseId', i) as string;
+                    const sql = this.getNodeParameter('query', i) as string;
+                
+                    // optional collection
+                    const additional = (this.getNodeParameter('additionalFields', i, {}) || {}) as Record<string, any>;
+                    const catalog = (additional.catalog as string) || undefined;
+                    const schema = (additional.schema as string) || undefined;
+                
+                    // UI gives a number (seconds). Databricks API expects a duration string like "60s".
+                    const timeoutNum = typeof additional.timeout === 'number' ? additional.timeout : 60;
+                    const waitTimeout = `${timeoutNum}s`;
+                
+                    // --- Build request body for POST /api/2.0/sql/statements ---
+                    const body: any = {
+                      warehouse_id: warehouseId,
+                      statement: sql,
+                      // INLINE is simplest; if you expect very large results, switch to "EXTERNAL_LINKS".
+                      disposition: 'INLINE',
+                      wait_timeout: waitTimeout,
+                    };
+                    if (catalog) body.catalog = catalog;
+                    if (schema) body.schema = schema;
+                
+                    this.logger.debug('Databricks SQL submit body', body);
+                
+                    // --- Submit the statement ---
+                    const submitted = await postSqlStatement(this, host, credentials.token, body);
+                    const statementId: string | undefined = submitted?.statement_id;
+                    if (!statementId) {
+                      throw new Error(`No statement_id returned from Databricks. Response: ${JSON.stringify(submitted)}`);
+                    }
+                
+                    // --- Poll for completion ---
+                    const startedAt = Date.now();
+                    const maxOverallMs = 5 * 60 * 1000; // hard stop after 5 minutes
+                    let backoff = 500;                  // 0.5s initial poll interval
+                    let current = submitted;
+                
+                    // Databricks returns state in different shapes depending on rev; normalize:
+                    const readState = (obj: any): string | undefined => obj?.status?.state || obj?.state?.status || obj?.state;
+                
+                    while (true) {
+                      const state = readState(current);
+                      if (state === 'SUCCEEDED') break;
+                
+                      if (['FAILED', 'CANCELED', 'CLOSED'].includes(state || '')) {
+                        const errPayload = current?.error || current?.status?.error || current;
+                        throw new Error(`Statement ${state}. Details: ${JSON.stringify(errPayload)}`);
+                      }
+                
+                      if (Date.now() - startedAt > maxOverallMs) {
+                        throw new Error(`Timed out waiting for statement ${statementId}`);
+                      }
+                
+                      await sleep(backoff);
+                      backoff = Math.min(backoff * 1.5, 5000);
+                      current = await getSqlStatement(this, host, credentials.token, statementId);
+                    }
+                
+                    // --- Extract results into n8n items ---
+                    const items: INodeExecutionData[] = [];
+                    const result = current?.result;
+                
+                    if (!result) {
+                      // DDL or statements without a rowset -> return empty but successful
+                      returnData.push({ json: { success: true, rowCount: 0 } });
+                    } else if (result.data_array && result.schema?.columns) {
+                      // INLINE disposition
+                      items.push(...rowsToItems(result.schema.columns, result.data_array));
+                      returnData.push(...items);
+                    } else if (current?.manifest?.total_chunk_count || (result.external_links && result.external_links.length)) {
+                      // EXTERNAL_LINKS disposition (or mixed)
+                      const chunks = result.external_links as string[]; // presigned URLs
+                      for (const link of chunks) {
+                        const chunk = await fetchExternalChunkJson(link);
+                        items.push(...rowsToItems(chunk.schema.columns, chunk.data_array));
+                      }
+                      returnData.push(...items);
+                    } else {
+                      // Unexpected shape; surface the payload for debugging
+                      returnData.push({ json: { warning: 'No rows found and no external links', raw: current } });
+                    }
+                  } else {
+                    // If you advertise more operations under Databricks SQL later, add them here:
+                    throw new Error(`Unsupported Databricks SQL operation: ${operation}`);
+                  }
               } else {
                   this.logger.debug('Passing through unhandled resource', { resource });
                   returnData.push({
@@ -331,7 +419,8 @@ function rowsToItems(
                   if (this.continueOnFail()) {
                       returnData.push({ 
                           json: { 
-                              error: `API Error: ${error.response.status} ${error.response.statusText}`, details: error.response.data
+                              error: `API Error: ${error.response.status} ${error.response.statusText}`, 
+                              details: error.response.data
                           } 
                       });
                   } else {
@@ -349,99 +438,6 @@ function rowsToItems(
                               details: error.message
                           } 
                       });
-                  } else if (resource === 'databricksSql') {
-                      const credentials = (await this.getCredentials('databricks')) as DatabricksCredentials;
-                      const host = credentials.host;
-                    
-                      if (operation === 'executeQuery') {
-                        // --- Read node params (your UI uses "query" for SQL text, plus warehouseId & additionalFields.*) ---
-                        const warehouseId = this.getNodeParameter('warehouseId', i) as string;
-                        const sql = this.getNodeParameter('query', i) as string;
-                    
-                        // optional collection
-                        const additional = (this.getNodeParameter('additionalFields', i, {}) || {}) as Record<string, any>;
-                        const catalog = (additional.catalog as string) || undefined;
-                        const schema = (additional.schema as string) || undefined;
-                    
-                        // UI gives a number (seconds). Databricks API expects a duration string like "60s".
-                        const timeoutNum = typeof additional.timeout === 'number' ? additional.timeout : 60;
-                        const waitTimeout = `${timeoutNum}s`;
-                    
-                        // --- Build request body for POST /api/2.0/sql/statements ---
-                        const body: any = {
-                          warehouse_id: warehouseId,
-                          statement: sql,
-                          // INLINE is simplest; if you expect very large results, switch to "EXTERNAL_LINKS".
-                          disposition: 'INLINE',
-                          wait_timeout: waitTimeout,
-                        };
-                        if (catalog) body.catalog = catalog;
-                        if (schema) body.schema = schema;
-                    
-                        this.logger.debug('Databricks SQL submit body', body);
-                    
-                        // --- Submit the statement ---
-                        const submitted = await postSqlStatement(this, host, credentials.token, body);
-                        const statementId: string | undefined = submitted?.statement_id;
-                        if (!statementId) {
-                          throw new Error(`No statement_id returned from Databricks. Response: ${JSON.stringify(submitted)}`);
-                        }
-                    
-                        // --- Poll for completion ---
-                        const startedAt = Date.now();
-                        const maxOverallMs = 5 * 60 * 1000; // hard stop after 5 minutes
-                        let backoff = 500;                  // 0.5s initial poll interval
-                        let current = submitted;
-                    
-                        // Databricks returns state in different shapes depending on rev; normalize:
-                        const readState = (obj: any): string | undefined => obj?.status?.state || obj?.state?.status || obj?.state;
-                    
-                        while (true) {
-                          const state = readState(current);
-                          if (state === 'SUCCEEDED') break;
-                    
-                          if (['FAILED', 'CANCELED', 'CLOSED'].includes(state || '')) {
-                            const errPayload = current?.error || current?.status?.error || current;
-                            throw new Error(`Statement ${state}. Details: ${JSON.stringify(errPayload)}`);
-                          }
-                    
-                          if (Date.now() - startedAt > maxOverallMs) {
-                            throw new Error(`Timed out waiting for statement ${statementId}`);
-                          }
-                    
-                          await sleep(backoff);
-                          backoff = Math.min(backoff * 1.5, 5000);
-                          current = await getSqlStatement(this, host, credentials.token, statementId);
-                        }
-                    
-                        // --- Extract results into n8n items ---
-                        const items: INodeExecutionData[] = [];
-                        const result = current?.result;
-                    
-                        if (!result) {
-                          // DDL or statements without a rowset -> return empty but successful
-                          returnData.push({ json: { success: true, rowCount: 0 } });
-                        } else if (result.data_array && result.schema?.columns) {
-                          // INLINE disposition
-                          items.push(...rowsToItems(result.schema.columns, result.data_array));
-                          returnData.push(...items);
-                        } else if (current?.manifest?.total_chunk_count || (result.external_links && result.external_links.length)) {
-                          // EXTERNAL_LINKS disposition (or mixed)
-                          const chunks = result.external_links as string[]; // presigned URLs
-                          for (const link of chunks) {
-                            const chunk = await fetchExternalChunkJson(link);
-                            items.push(...rowsToItems(chunk.schema.columns, chunk.data_array));
-                          }
-                          returnData.push(...items);
-                        } else {
-                          // Unexpected shape; surface the payload for debugging
-                          returnData.push({ json: { warning: 'No rows found and no external links', raw: current } });
-                        }
-                      } else {
-                        // If you advertise more operations under Databricks SQL later, add them here:
-                        throw new Error(`Unsupported Databricks SQL operation: ${operation}`);
-                      }
-
                   } else {
                       throw new Error('Network Error: No response received from server');
                   }
