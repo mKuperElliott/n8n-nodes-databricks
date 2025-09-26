@@ -1,5 +1,5 @@
 {
-  "name": "n8n-nodes-databricks",
+  "name": "n8n-nodes-databricks-custom",
   "version": "0.1.1",
   "description": "Databricks node for n8n",
   "keywords": [
